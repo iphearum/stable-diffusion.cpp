@@ -74,6 +74,7 @@ add_executable(${TARGET}
     routes_sdapi.cpp
     routes_sdcpp.cpp
     routes_stream.cpp
+    routes_llm_proxy.cpp
 )
 
 if(HAVE_FRONTEND_BUILD)

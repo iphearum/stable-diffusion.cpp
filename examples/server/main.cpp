@@ -10,6 +10,7 @@
 #include "async_jobs.h"
 #include "common/common.h"
 #include "common/resource_owners.hpp"
+#include "llm_proxy.h"
 #include "routes.h"
 #include "runtime.h"
 
@@ -100,6 +101,40 @@ int main(int argc, const char** argv) {
     std::vector<UpscalerEntry> upscaler_cache;
     std::mutex upscaler_mutex;
     AsyncJobManager async_job_manager;
+
+    // ---- LLM proxy setup ----
+
+    LLMProxyConfig llm_proxy_cfg;
+    int llm_subprocess_pid = -1;
+
+    if (!svr_params.llm_binary.empty() && !svr_params.llm_model.empty()) {
+        // Auto-launch mode: start llama-server as a child process
+        llm_subprocess_pid = launch_llm_subprocess(
+            svr_params.llm_binary,
+            svr_params.llm_model,
+            svr_params.llm_port);
+
+        if (llm_subprocess_pid > 0) {
+            llm_proxy_cfg.host = "127.0.0.1";
+            llm_proxy_cfg.port = svr_params.llm_port;
+
+            LOG_INFO("waiting for llama-server to become ready...\n");
+            if (!wait_for_llm_ready(llm_proxy_cfg, 20000)) {
+                LOG_WARN("llama-server did not become ready in time; "
+                         "LLM proxy will be registered but may not respond\n");
+            } else {
+                LOG_INFO("llama-server is ready\n");
+            }
+        }
+    } else if (!svr_params.llm_proxy_url.empty()) {
+        // Manual proxy mode: connect to a user-supplied llama-server URL
+        llm_proxy_cfg = parse_llm_proxy_url(svr_params.llm_proxy_url);
+        if (!llm_proxy_cfg.enabled()) {
+            LOG_WARN("could not parse --llm-proxy URL: %s\n",
+                     svr_params.llm_proxy_url.c_str());
+        }
+    }
+
     ServerRuntime runtime = {
         sd_ctx.get(),
         &sd_ctx_mutex,
@@ -111,6 +146,7 @@ int main(int argc, const char** argv) {
         &upscaler_cache,
         &upscaler_mutex,
         &async_job_manager,
+        llm_proxy_cfg.enabled() ? &llm_proxy_cfg : nullptr,
     };
 
     std::thread async_worker(async_job_worker, std::ref(runtime));
@@ -145,9 +181,13 @@ int main(int argc, const char** argv) {
     register_sdapi_endpoints(svr, runtime);
     register_sdcpp_api_endpoints(svr, runtime);
     register_stream_endpoints(svr, runtime);
+    // LLM proxy routes are registered last so they can override /v1/models
+    register_llm_proxy_endpoints(svr, runtime);
 
     LOG_INFO("listening on: %s:%d\n", svr_params.listen_ip.c_str(), svr_params.listen_port);
     svr.listen(svr_params.listen_ip, svr_params.listen_port);
+
+    // ---- Shutdown ----
 
     {
         std::lock_guard<std::mutex> lock(async_job_manager.mutex);
@@ -155,5 +195,10 @@ int main(int argc, const char** argv) {
     }
     async_job_manager.cv.notify_all();
     async_worker.join();
+
+    if (llm_subprocess_pid > 0) {
+        kill_llm_subprocess(llm_subprocess_pid);
+    }
+
     return 0;
 }

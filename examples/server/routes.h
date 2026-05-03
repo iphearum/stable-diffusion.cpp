@@ -10,3 +10,4 @@ void register_openai_api_endpoints(httplib::Server& svr, ServerRuntime& rt);
 void register_sdapi_endpoints(httplib::Server& svr, ServerRuntime& rt);
 void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt);
 void register_stream_endpoints(httplib::Server& svr, ServerRuntime& rt);
+void register_llm_proxy_endpoints(httplib::Server& svr, ServerRuntime& rt);
