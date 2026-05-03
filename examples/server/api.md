@@ -2,11 +2,13 @@
 
 This document describes the server-facing APIs exposed by `examples/server`.
 
-The server currently exposes three API families:
+The server exposes four API families:
 
 - `OpenAI API` under `/v1/...`
 - `Stable Diffusion WebUI API` under `/sdapi/v1/...`
 - `sdcpp API` under `/sdcpp/v1/...`
+- `Streaming API` under `/sdapi/v1/.../stream` — real-time base64 preview frames via SSE
+- `LLM Gateway` — optional proxy to a running `llama-server` (see [Unified LLM + SD Gateway](#unified-llm--sd-gateway))
 
 The `sdcpp API` is the native API surface.
 Its request schema is the same schema used by `sd_cpp_extra_args`.
@@ -1286,3 +1288,696 @@ Example cancelled job:
 - `400 Bad Request` for an empty body, unsupported model mode, invalid JSON, invalid generation parameters, or an unsupported output format
 - `429 Too Many Requests` when the job queue is full
 - `500 Internal Server Error` for unexpected server exceptions during submission
+
+---
+
+## Streaming API
+
+The streaming API adds Server-Sent Events (SSE) endpoints that deliver real-time
+base64-encoded preview images after every diffusion step, then the full-quality
+final image when generation is complete.  This is the same pattern used by
+`llama.cpp` for token streaming.
+
+### Endpoints
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/sdapi/v1/txt2img/stream` | Streaming text-to-image |
+| `POST` | `/sdapi/v1/img2img/stream` | Streaming image-to-image |
+
+Both endpoints accept **the same request body** as their non-streaming
+counterparts (`/sdapi/v1/txt2img` and `/sdapi/v1/img2img`) plus two
+additional optional fields.
+
+### Additional Request Fields
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `stream_preview_interval` | `integer` | `1` | Emit a preview every N steps. Set to `0` to disable previews and receive only step-progress and the final result. |
+| `stream_preview_mode` | `string` | `"proj"` | Preview quality. `"proj"` is a fast linear projection from latent space. `"tae"` uses Tiny AutoEncoder. `"vae"` decodes with the full VAE (slower, higher quality). |
+
+### Response Format
+
+The response uses `Content-Type: text/event-stream`.
+Each event is one line starting with `data: ` followed by a JSON object, ending with a blank line.
+
+#### Event types
+
+**`step`** — emitted after every denoising step
+
+```
+data: {"type":"step","step":1,"total_steps":20,"time":0.43}
+
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `type` | `string` | `"step"` |
+| `step` | `integer` | Current step index (1-based) |
+| `total_steps` | `integer` | Total steps for this generation |
+| `time` | `number` | Seconds elapsed for this step |
+
+---
+
+**`preview`** — emitted every `stream_preview_interval` steps (when previews are enabled)
+
+```
+data: {"type":"preview","step":1,"total_steps":20,"b64_json":"<base64-jpeg>"}
+
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `type` | `string` | `"preview"` |
+| `step` | `integer` | Step at which this preview was captured |
+| `total_steps` | `integer` | Total steps |
+| `b64_json` | `string` | Base64-encoded JPEG (quality 75) of the current latent state |
+
+---
+
+**`result`** — emitted once when generation is complete
+
+```
+data: {"type":"result","images":["<base64-png>",...],"parameters":{...}}
+
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `type` | `string` | `"result"` |
+| `images` | `array<string>` | Base64-encoded PNG images (one per batch item) |
+| `parameters` | `object` | Echo of the original request body |
+
+---
+
+**`error`** — emitted if generation fails
+
+```
+data: {"type":"error","message":"generate_image returned no results"}
+
+```
+
+---
+
+**`[DONE]`** — always the final event
+
+```
+data: [DONE]
+
+```
+
+### Examples
+
+#### curl — basic streaming
+
+```bash
+curl -N -X POST http://127.0.0.1:1234/sdapi/v1/txt2img/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a photorealistic cat sitting on a wooden table",
+    "negative_prompt": "blurry, low quality",
+    "width": 512,
+    "height": 512,
+    "steps": 20,
+    "cfg_scale": 7.0,
+    "seed": 42
+  }'
+```
+
+**Expected output** (one line per event, blank line between each):
+
+```
+data: {"type":"step","step":1,"total_steps":20,"time":0.44}
+
+data: {"type":"preview","step":1,"total_steps":20,"b64_json":"/9j/4AAQSkZJRgAB..."}
+
+data: {"type":"step","step":2,"total_steps":20,"time":0.41}
+
+data: {"type":"preview","step":2,"total_steps":20,"b64_json":"/9j/4AAQSkZJRgAB..."}
+
+...
+
+data: {"type":"step","step":20,"total_steps":20,"time":0.43}
+
+data: {"type":"preview","step":20,"total_steps":20,"b64_json":"/9j/4AAQSkZJRgAB..."}
+
+data: {"type":"result","images":["iVBORw0KGgoAAAANSUhEUgAA..."],"parameters":{"prompt":"a photorealistic cat..."}}
+
+data: [DONE]
+```
+
+#### curl — disable previews, progress only
+
+```bash
+curl -N -X POST http://127.0.0.1:1234/sdapi/v1/txt2img/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a landscape at sunset",
+    "steps": 30,
+    "stream_preview_interval": 0
+  }'
+```
+
+**Expected output** (step events only, then result):
+
+```
+data: {"type":"step","step":1,"total_steps":30,"time":0.45}
+
+data: {"type":"step","step":2,"total_steps":30,"time":0.42}
+
+...
+
+data: {"type":"result","images":["iVBORw0KGgoAAAA..."],"parameters":{...}}
+
+data: [DONE]
+```
+
+#### curl — preview every 5 steps using TAE decoder
+
+```bash
+curl -N -X POST http://127.0.0.1:1234/sdapi/v1/txt2img/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a castle in a forest",
+    "steps": 20,
+    "stream_preview_interval": 5,
+    "stream_preview_mode": "tae"
+  }'
+```
+
+#### Python — save previews to disk as they arrive
+
+```python
+import json, base64, re, urllib.request
+
+url = "http://127.0.0.1:1234/sdapi/v1/txt2img/stream"
+body = json.dumps({
+    "prompt": "a robot in a garden",
+    "steps": 20,
+    "width": 512,
+    "height": 512,
+}).encode()
+
+req = urllib.request.Request(url, data=body,
+                             headers={"Content-Type": "application/json"})
+
+with urllib.request.urlopen(req) as resp:
+    for raw_line in resp:
+        line = raw_line.decode().strip()
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        if payload == "[DONE]":
+            print("generation complete")
+            break
+        event = json.loads(payload)
+        if event["type"] == "preview":
+            fname = f"preview_step_{event['step']:03d}.jpg"
+            with open(fname, "wb") as f:
+                f.write(base64.b64decode(event["b64_json"]))
+            print(f"saved {fname}  (step {event['step']}/{event['total_steps']})")
+        elif event["type"] == "result":
+            for i, img_b64 in enumerate(event["images"]):
+                fname = f"result_{i}.png"
+                with open(fname, "wb") as f:
+                    f.write(base64.b64decode(img_b64))
+                print(f"saved final image: {fname}")
+        elif event["type"] == "step":
+            print(f"step {event['step']}/{event['total_steps']}  {event['time']:.2f}s")
+        elif event["type"] == "error":
+            print(f"error: {event['message']}")
+            break
+```
+
+**Console output:**
+
+```
+step 1/20  0.44s
+saved preview_step_001.jpg  (step 1/20)
+step 2/20  0.41s
+saved preview_step_002.jpg  (step 2/20)
+...
+step 20/20  0.43s
+saved preview_step_020.jpg  (step 20/20)
+saved final image: result_0.png
+generation complete
+```
+
+#### JavaScript (browser EventSource alternative via fetch)
+
+```javascript
+// EventSource only supports GET, so use fetch for POST streaming
+async function generateStreaming(prompt) {
+  const resp = await fetch("http://127.0.0.1:1234/sdapi/v1/txt2img/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt, steps: 20, width: 512, height: 512 }),
+  });
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    for (const line of buffer.split("\n")) {
+      if (!line.startsWith("data: ")) continue;
+      const payload = line.slice(6).trim();
+      if (payload === "[DONE]") return;
+
+      const event = JSON.parse(payload);
+      if (event.type === "preview") {
+        document.getElementById("preview").src =
+          "data:image/jpeg;base64," + event.b64_json;
+        document.getElementById("progress").textContent =
+          `Step ${event.step} / ${event.total_steps}`;
+      } else if (event.type === "result") {
+        document.getElementById("preview").src =
+          "data:image/png;base64," + event.images[0];
+        document.getElementById("progress").textContent = "Done";
+      }
+    }
+    buffer = buffer.includes("\n")
+      ? buffer.slice(buffer.lastIndexOf("\n") + 1)
+      : buffer;
+  }
+}
+```
+
+#### img2img streaming
+
+```bash
+# Encode init image to base64 first
+INIT_B64=$(base64 -w 0 my_photo.png)
+
+curl -N -X POST http://127.0.0.1:1234/sdapi/v1/img2img/stream \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"prompt\": \"oil painting style\",
+    \"init_images\": [\"$INIT_B64\"],
+    \"denoising_strength\": 0.6,
+    \"steps\": 20,
+    \"stream_preview_interval\": 2
+  }"
+```
+
+### Notes
+
+- Preview images are JPEG at quality 75 to minimise per-event payload size.
+  The final `result` images are full-quality PNG.
+- `stream_preview_mode: "vae"` produces the highest-quality previews but adds
+  a full VAE decode at each previewed step, which can be slow.
+- If the client disconnects mid-stream, the generation continues to completion
+  in the background (the result is discarded). This is consistent with how
+  the synchronous endpoints behave.
+- Only one generation can run at a time; streaming requests queue like any
+  other request.
+
+---
+
+## Unified LLM + SD Gateway
+
+When `sd-server` is configured with a `llama-server` endpoint it becomes a
+**unified gateway**: image generation is handled internally and LLM text
+generation is proxied to the configured `llama-server`, all on the same port.
+
+This avoids the GGML symbol-conflict that would arise from linking both
+libraries into a single binary.
+
+### Setup
+
+#### Option A — connect to an already-running `llama-server`
+
+Start `llama-server` separately, then pass its URL to `sd-server`:
+
+```bash
+# Terminal 1
+llama-server \
+  --model /models/llama-3.2-3b-instruct-q4_k_m.gguf \
+  --port 8081 \
+  --host 127.0.0.1
+
+# Terminal 2
+sd-server \
+  --model /models/flux1-dev-q8_0.gguf \
+  --llm-proxy http://127.0.0.1:8081
+```
+
+#### Option B — auto-launch `llama-server` from `sd-server`
+
+`sd-server` will fork `llama-server` at startup and kill it on shutdown:
+
+```bash
+sd-server \
+  --model /models/flux1-dev-q8_0.gguf \
+  --llm-binary /usr/local/bin/llama-server \
+  --llm-model  /models/llama-3.2-3b-instruct-q4_k_m.gguf \
+  --llm-port   8081
+```
+
+`sd-server` polls `GET /health` on the child process and waits up to 20 s
+before accepting requests.
+
+### New CLI Flags
+
+| Flag | Description |
+| --- | --- |
+| `--llm-proxy <url>` | URL of a running `llama-server` (e.g. `http://localhost:8081`) |
+| `--llm-binary <path>` | Path to the `llama-server` binary (auto-launch) |
+| `--llm-model <path>` | Path to the GGUF model for auto-launch |
+| `--llm-port <port>` | Port for the auto-launched `llama-server` (default: `8081`) |
+
+### Unified Endpoint Table
+
+When the LLM proxy is active, the following routes are available on the
+**same port** as all existing SD routes:
+
+| Method | Path | Handler | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/v1/models` | Merged | SD model + all LLM models from `llama-server` |
+| `GET` | `/health` | Unified | `{"sd_status":"ok","llm_status":"ok"}` |
+| `POST` | `/v1/chat/completions` | Proxy | Full streaming SSE passthrough |
+| `POST` | `/v1/completions` | Proxy | Full streaming SSE passthrough |
+| `POST` | `/v1/embeddings` | Proxy | |
+| `POST` | `/completion` | Proxy | llama.cpp native endpoint |
+| `POST` | `/tokenize` | Proxy | |
+| `POST` | `/detokenize` | Proxy | |
+| `GET` | `/props` | Proxy | llama-server model properties |
+| `GET` | `/slots` | Proxy | llama-server worker slots |
+| `POST` | `/v1/images/generations` | SD | Unchanged |
+| `POST` | `/v1/images/edits` | SD | Unchanged |
+| `POST` | `/sdapi/v1/txt2img` | SD | Unchanged |
+| `POST` | `/sdapi/v1/txt2img/stream` | SD | Unchanged |
+| `POST` | `/sdapi/v1/img2img` | SD | Unchanged |
+| `POST` | `/sdapi/v1/img2img/stream` | SD | Unchanged |
+| `POST` | `/sdcpp/v1/img_gen` | SD | Unchanged |
+| `POST` | `/sdcpp/v1/vid_gen` | SD | Unchanged |
+
+### Examples
+
+#### Check health
+
+```bash
+curl http://127.0.0.1:1234/health
+```
+
+**Response (both services up):**
+
+```json
+{
+  "sd_status": "ok",
+  "llm_status": "ok",
+  "status": "ok"
+}
+```
+
+**Response (llama-server unreachable):**
+
+```json
+{
+  "sd_status": "ok",
+  "llm_status": "unavailable",
+  "status": "ok"
+}
+```
+
+#### List all models
+
+```bash
+curl http://127.0.0.1:1234/v1/models
+```
+
+**Response:**
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "sd-cpp-local",
+      "object": "model",
+      "owned_by": "local"
+    },
+    {
+      "id": "llama-3.2-3b-instruct-q4_k_m",
+      "object": "model",
+      "owned_by": "llamacpp"
+    }
+  ]
+}
+```
+
+#### LLM chat completion (non-streaming)
+
+```bash
+curl -X POST http://127.0.0.1:1234/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.2-3b-instruct-q4_k_m",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "Describe a dramatic landscape in one sentence."}
+    ],
+    "temperature": 0.7,
+    "max_tokens": 120
+  }'
+```
+
+**Response:**
+
+```json
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 1775401200,
+  "model": "llama-3.2-3b-instruct-q4_k_m",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Towering obsidian cliffs plunge into a churning jade sea beneath a sky split by violet lightning and twin moons."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 32,
+    "completion_tokens": 28,
+    "total_tokens": 60
+  }
+}
+```
+
+#### LLM chat completion (streaming)
+
+```bash
+curl -N -X POST http://127.0.0.1:1234/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.2-3b-instruct-q4_k_m",
+    "messages": [{"role": "user", "content": "Count to five."}],
+    "stream": true
+  }'
+```
+
+**Response (SSE stream):**
+
+```
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1775401200,"model":"llama-3.2-3b-instruct-q4_k_m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1775401200,"model":"llama-3.2-3b-instruct-q4_k_m","choices":[{"index":0,"delta":{"content":"One"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1775401200,"model":"llama-3.2-3b-instruct-q4_k_m","choices":[{"index":0,"delta":{"content":", two"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1775401200,"model":"llama-3.2-3b-instruct-q4_k_m","choices":[{"index":0,"delta":{"content":", three, four, five."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc","object":"chat.completion.chunk","created":1775401200,"model":"llama-3.2-3b-instruct-q4_k_m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":9,"total_tokens":21}}
+
+data: [DONE]
+```
+
+#### Generate an image and then describe it with the LLM
+
+```bash
+# Step 1: generate image
+curl -s -X POST http://127.0.0.1:1234/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"a red barn in a snowy field","size":"512x512"}' \
+  | python3 -c "
+import sys, json, base64
+data = json.load(sys.stdin)
+img = base64.b64decode(data['data'][0]['b64_json'])
+open('barn.png','wb').write(img)
+print('saved barn.png')
+"
+
+# Step 2: ask the LLM to write a prompt variation
+curl -s -X POST http://127.0.0.1:1234/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.2-3b-instruct-q4_k_m",
+    "messages": [
+      {"role":"user","content":"Write a Stable Diffusion prompt for a night-time version of: a red barn in a snowy field"}
+    ],
+    "max_tokens": 80
+  }' | python3 -c "
+import sys,json
+print(json.load(sys.stdin)['choices'][0]['message']['content'])
+"
+```
+
+**Output:**
+
+```
+saved barn.png
+a weathered red barn under a star-filled winter night sky, snow-covered fields, moonlight casting blue shadows, cinematic, 8k, photorealistic
+```
+
+#### Text embeddings
+
+```bash
+curl -X POST http://127.0.0.1:1234/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.2-3b-instruct-q4_k_m",
+    "input": "a cat on a mat"
+  }'
+```
+
+**Response:**
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "embedding",
+      "index": 0,
+      "embedding": [0.0123, -0.0456, 0.0789, ...]
+    }
+  ],
+  "model": "llama-3.2-3b-instruct-q4_k_m",
+  "usage": {"prompt_tokens": 5, "total_tokens": 5}
+}
+```
+
+#### Tokenize / detokenize
+
+```bash
+# Tokenize text
+curl -X POST http://127.0.0.1:1234/tokenize \
+  -H "Content-Type: application/json" \
+  -d '{"content": "Hello, world!"}'
+```
+
+**Response:**
+
+```json
+{"tokens": [9906, 11, 1917, 0]}
+```
+
+```bash
+# Detokenize tokens back to text
+curl -X POST http://127.0.0.1:1234/detokenize \
+  -H "Content-Type: application/json" \
+  -d '{"tokens": [9906, 11, 1917, 0]}'
+```
+
+**Response:**
+
+```json
+{"content": "Hello, world!"}
+```
+
+#### Python — combined image + text pipeline
+
+```python
+import json, base64, urllib.request
+
+BASE = "http://127.0.0.1:1234"
+
+def post(path, body):
+    req = urllib.request.Request(
+        BASE + path, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as r:
+        return json.load(r)
+
+# 1. Generate image
+img_resp = post("/v1/images/generations", {
+    "prompt": "a futuristic city at dusk, neon lights",
+    "size": "512x512",
+    "output_format": "png",
+})
+img_b64 = img_resp["data"][0]["b64_json"]
+with open("city.png", "wb") as f:
+    f.write(base64.b64decode(img_b64))
+print("image saved → city.png")
+
+# 2. Ask LLM for a follow-up prompt
+llm_resp = post("/v1/chat/completions", {
+    "model": "llama-3.2-3b-instruct-q4_k_m",
+    "messages": [{
+        "role": "user",
+        "content": (
+            "I generated an image with this prompt: "
+            "'a futuristic city at dusk, neon lights'. "
+            "Suggest one specific improvement to the prompt "
+            "that would add more cinematic atmosphere. "
+            "Reply with only the improved prompt, no explanation."
+        ),
+    }],
+    "max_tokens": 60,
+    "temperature": 0.8,
+})
+improved = llm_resp["choices"][0]["message"]["content"].strip()
+print("improved prompt →", improved)
+
+# 3. Generate the improved image
+img2_resp = post("/v1/images/generations", {
+    "prompt": improved,
+    "size": "512x512",
+    "output_format": "png",
+})
+with open("city_v2.png", "wb") as f:
+    f.write(base64.b64decode(img2_resp["data"][0]["b64_json"]))
+print("improved image saved → city_v2.png")
+```
+
+**Console output:**
+
+```
+image saved → city.png
+improved prompt → a sprawling futuristic city at golden hour, neon-lit skyscrapers reflected in rain-slicked streets, long exposure bokeh, cinematic color grading, dramatic volumetric light
+improved image saved → city_v2.png
+```
+
+### Proxy Behaviour Details
+
+- **Streaming detection**: the proxy scans the request body for `"stream":true`.
+  When found, the response is served as `text/event-stream` with chunked
+  transfer encoding.  SSE chunks are forwarded byte-for-byte with no
+  intermediate buffering.
+- **Header forwarding**: standard hop-by-hop headers (`Host`, `Connection`,
+  `Transfer-Encoding`, `Content-Length`, `Accept-Encoding`) are stripped
+  before forwarding.  All other headers (e.g. `Authorization`) are passed through.
+- **Timeouts**: read timeout is 300 s to accommodate long generation runs.
+- **Error response**: if `llama-server` is unreachable, the proxy returns
+  `502 Bad Gateway` with `{"error":{"message":"llm proxy unreachable","type":"proxy_error"}}`.
+- **Auto-launch lifecycle**: when `--llm-binary` + `--llm-model` are used,
+  the child process receives `SIGTERM` when `sd-server` exits, followed by
+  `waitpid` to prevent zombie processes.
+
+### Notes
+
+- The proxy does **not** validate or rewrite LLM request bodies; it forwards
+  them verbatim.  Use whatever request format `llama-server` expects.
+- Image generation and text generation requests are fully independent and can
+  run concurrently (they use separate backends).
+- The `/v1/models` merge only appends entries from `llama-server`; it does not
+  deduplicate.  If `llama-server` is unreachable, only the SD model entry is
+  returned.
