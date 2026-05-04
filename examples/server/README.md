@@ -21,12 +21,67 @@ After the server starts successfully:
 * the web UI is available at `http://127.0.0.1:1234/`
 * the native async API is available under `/sdcpp/v1/...`
 * the compatibility APIs are available under `/v1/...` and `/sdapi/v1/...`
+* the **streaming SSE API** is available under `/sdapi/v1/txt2img/stream` and `/sdapi/v1/img2img/stream`
 
 If you want to use a different host or port, pass:
 
 ```bash
 --listen-ip <ip> --listen-port <port>
 ```
+
+# Streaming image generation
+
+Streaming endpoints send per-step base64 preview images as Server-Sent Events
+while the diffusion loop runs, then the full-quality PNG result at the end.
+No extra server flags are required; the endpoints are always available.
+
+```bash
+# Stream 20 steps with a preview after every step (default)
+curl -N -X POST http://127.0.0.1:1234/sdapi/v1/txt2img/stream \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"a cat on a mountain","steps":20,"width":512,"height":512}'
+```
+
+Each response line looks like:
+
+```
+data: {"type":"step","step":1,"total_steps":20,"time":0.43}
+data: {"type":"preview","step":1,"total_steps":20,"b64_json":"<jpeg-base64>"}
+...
+data: {"type":"result","images":["<png-base64>"],"parameters":{...}}
+data: [DONE]
+```
+
+See [`api.md`](api.md#streaming-api) for full field documentation and
+client examples in Python and JavaScript.
+
+# Unified LLM + SD gateway
+
+`sd-server` can proxy LLM text requests to a running `llama-server`, presenting
+both image generation and text generation on the same port.
+
+```bash
+# Option A: connect to an already-running llama-server
+sd-server -m /models/flux.safetensors \
+  --llm-proxy http://localhost:8081
+
+# Option B: auto-launch llama-server at startup
+sd-server -m /models/flux.safetensors \
+  --llm-binary /usr/local/bin/llama-server \
+  --llm-model  /models/llama-3.2-3b.gguf \
+  --llm-port   8081
+```
+
+When active, the unified gateway exposes:
+
+* `GET  /v1/models` — merged list of SD + LLM models
+* `GET  /health` — combined health status
+* `POST /v1/chat/completions` — LLM chat (streaming passthrough)
+* `POST /v1/completions` — LLM completion (streaming passthrough)
+* `POST /v1/embeddings`, `/tokenize`, `/detokenize`, `/props`, `/slots`
+
+See [`api.md`](api.md#unified-llm--sd-gateway) for full documentation,
+all endpoint details, and Python/curl examples.
 
 # Frontend
 

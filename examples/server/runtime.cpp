@@ -192,10 +192,14 @@ ArgOptions SDSvrParams::get_options() {
     options.string_options = {
         {"-l", "--listen-ip", "server listen ip (default: 127.0.0.1)", &listen_ip},
         {"", "--serve-html-path", "path to HTML file to serve at root (optional)", &serve_html_path},
+        {"", "--llm-proxy", "URL of a running llama-server to proxy LLM requests to (e.g. http://localhost:8081)", &llm_proxy_url},
+        {"", "--llm-binary", "path to llama-server binary; combined with --llm-model to auto-launch", &llm_binary},
+        {"", "--llm-model", "path to GGUF model file for auto-launched llama-server", &llm_model},
     };
 
     options.int_options = {
         {"", "--listen-port", "server listen port (default: 1234)", &listen_port},
+        {"", "--llm-port", "port for auto-launched llama-server (default: 8081)", &llm_port},
     };
 
     options.bool_options = {

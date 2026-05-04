@@ -9,6 +9,7 @@
 #include <json.hpp>
 #include "common/common.h"
 #include "common/resource_owners.hpp"
+#include "llm_proxy.h"
 #include "stable-diffusion.h"
 
 using json = nlohmann::json;
@@ -24,6 +25,12 @@ struct SDSvrParams {
     bool normal_exit = false;
     bool verbose     = false;
     bool color       = false;
+
+    // LLM proxy / auto-launch options
+    std::string llm_proxy_url;  // e.g. "http://localhost:8081"
+    std::string llm_binary;     // path to llama-server binary (auto-launch)
+    std::string llm_model;      // path to GGUF model (auto-launch)
+    int llm_port = 8081;        // port for auto-launched llama-server
 
     ArgOptions get_options();
     bool validate();
@@ -56,6 +63,7 @@ struct ServerRuntime {
     std::vector<UpscalerEntry>* upscaler_cache;
     std::mutex* upscaler_mutex;
     AsyncJobManager* async_job_manager;
+    LLMProxyConfig* llm_proxy;  // nullptr when LLM proxy is not configured
 };
 
 struct ImgGenJobRequest {
